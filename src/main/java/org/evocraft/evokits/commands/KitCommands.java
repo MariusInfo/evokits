@@ -11,6 +11,7 @@ import net.minecraft.network.chat.Component;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.item.ItemStack;
 import org.evocraft.evokits.data.KitManager;
+import org.evocraft.evokits.network.EvoKitsPacketHandler;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -24,7 +25,7 @@ public class KitCommands {
         // ==========================================
         dispatcher.register(Commands.literal("kit")
                 .executes(context -> {
-                    listKits(context.getSource());
+                    openKitsOrList(context.getSource());
                     return 1;
                 })
                 .then(Commands.argument("name", StringArgumentType.word())
@@ -39,7 +40,7 @@ public class KitCommands {
 
         dispatcher.register(Commands.literal("kits")
                 .executes(context -> {
-                    listKits(context.getSource());
+                    openKitsOrList(context.getSource());
                     return 1;
                 })
         );
@@ -105,6 +106,14 @@ public class KitCommands {
                                             return 1;
                                         }))))
         );
+    }
+
+    private static void openKitsOrList(CommandSourceStack source) {
+        if (source.getEntity() instanceof ServerPlayer player) {
+            EvoKitsPacketHandler.sendKitsToPlayer(player, true);
+            return;
+        }
+        listKits(source);
     }
 
     private static void listKits(CommandSourceStack source) {
