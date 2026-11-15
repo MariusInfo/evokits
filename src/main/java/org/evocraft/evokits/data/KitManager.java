@@ -36,7 +36,7 @@ public class KitManager {
         public List<String> crateKeys = new ArrayList<>();
     }
 
-    public final Map<String, Kit> kits = new HashMap<>();
+    public final Map<String, Kit> kits = new LinkedHashMap<>();
     private final Map<UUID, Map<String, Long>> cooldownCache = new ConcurrentHashMap<>();
     private final File file = new File(FMLPaths.CONFIGDIR.get().toFile(), "evocraft_kits.nbt");
 
