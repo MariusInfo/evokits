@@ -7,22 +7,29 @@ import net.minecraft.nbt.StringTag;
 import net.minecraft.network.chat.Component;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.item.ItemStack;
+import net.minecraftforge.fml.ModList;
 import net.minecraftforge.fml.loading.FMLPaths;
 import org.evocraft.evocore.data.CrateKeyManager;
 import org.evocraft.evocore.database.DatabaseManager;
 
 import java.io.File;
+import java.lang.reflect.Method;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.Statement;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.regex.Pattern;
 
 public class KitManager {
+    private static final Pattern VALID_KIT_NAME = Pattern.compile("^[A-Za-z0-9_-]{1,32}$");
     private static KitManager INSTANCE;
 
-    public static KitManager get() {
+    public static synchronized KitManager get() {
         if (INSTANCE == null) INSTANCE = new KitManager();
         return INSTANCE;
     }
@@ -36,48 +43,98 @@ public class KitManager {
         public List<String> crateKeys = new ArrayList<>();
     }
 
-    public final Map<String, Kit> kits = new LinkedHashMap<>();
+    public final Map<String, Kit> kits = Collections.synchronizedMap(new LinkedHashMap<>());
     private final Map<UUID, Map<String, Long>> cooldownCache = new ConcurrentHashMap<>();
     private final File file = new File(FMLPaths.CONFIGDIR.get().toFile(), "evocraft_kits.nbt");
+
+    private final ExecutorService dbExecutor = Executors.newSingleThreadExecutor(r -> {
+        Thread t = new Thread(r, "EvoKits DB Writer");
+        t.setDaemon(true);
+        return t;
+    });
+    private volatile boolean shuttingDown = false;
+
+    private static volatile boolean combatMethodChecked = false;
+    private static Method combatIsInCombatMethod = null;
 
     public KitManager() {
         load();
         initializeDB();
     }
 
-    public void initializeDB() {
-        new Thread(() -> {
-            synchronized (DatabaseManager.get()) {
-                try {
-                    Connection conn = DatabaseManager.get().getConnection();
-                    try (Statement stmt = conn.createStatement()) {
-                        stmt.executeUpdate("CREATE TABLE IF NOT EXISTS player_kit_cooldowns (" +
-                                "uuid VARCHAR(36) NOT NULL, " +
-                                "kit_name VARCHAR(64) NOT NULL, " +
-                                "last_claimed BIGINT NOT NULL, " +
-                                "PRIMARY KEY (uuid, kit_name))");
-                    }
-                } catch (Exception e) {
-                    e.printStackTrace();
-                }
+    public static boolean isValidKitName(String name) {
+        return name != null && VALID_KIT_NAME.matcher(name).matches();
+    }
+
+    public List<Kit> getKitsSnapshot() {
+        synchronized (kits) {
+            return new ArrayList<>(kits.values());
+        }
+    }
+
+    public void onPlayerLogout(UUID uuid) {
+        if (uuid != null) {
+            cooldownCache.remove(uuid);
+        }
+    }
+
+    public void shutdown() {
+        shuttingDown = true;
+        save();
+        dbExecutor.shutdown();
+        try {
+            if (!dbExecutor.awaitTermination(5, TimeUnit.SECONDS)) {
+                dbExecutor.shutdownNow();
             }
-        }).start();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            dbExecutor.shutdownNow();
+        }
+        synchronized (KitManager.class) {
+            if (INSTANCE == this) {
+                INSTANCE = null;
+            }
+        }
+    }
+
+    public void initializeDB() {
+        synchronized (DatabaseManager.get()) {
+            try {
+                Connection conn = DatabaseManager.get().getConnection();
+                if (conn == null || conn.isClosed()) return;
+                try (Statement stmt = conn.createStatement()) {
+                    stmt.executeUpdate("CREATE TABLE IF NOT EXISTS player_kit_cooldowns (" +
+                            "uuid VARCHAR(36) NOT NULL, " +
+                            "kit_name VARCHAR(64) NOT NULL, " +
+                            "last_claimed BIGINT NOT NULL, " +
+                            "PRIMARY KEY (uuid, kit_name))");
+                }
+            } catch (Exception e) {
+                e.printStackTrace();
+            }
+        }
     }
 
     public void save() {
         try {
+            File parent = file.getParentFile();
+            if (parent != null && !parent.exists()) {
+                parent.mkdirs();
+            }
             CompoundTag root = new CompoundTag();
             ListTag kitList = new ListTag();
-            for (Kit kit : kits.values()) {
+            for (Kit kit : getKitsSnapshot()) {
                 CompoundTag kTag = new CompoundTag();
                 kTag.putString("Name", kit.name);
                 kTag.putString("Permission", kit.permission);
                 kTag.putInt("Cooldown", kit.cooldownHours);
-                kTag.put("Icon", kit.icon.save(new CompoundTag()));
+                kTag.put("Icon", (kit.icon != null ? kit.icon : ItemStack.EMPTY).save(new CompoundTag()));
 
                 ListTag itemList = new ListTag();
                 for (ItemStack item : kit.items) {
-                    itemList.add(item.save(new CompoundTag()));
+                    if (item != null && !item.isEmpty()) {
+                        itemList.add(item.save(new CompoundTag()));
+                    }
                 }
                 kTag.put("Items", itemList);
 
@@ -99,71 +156,87 @@ public class KitManager {
     }
 
     public void load() {
-        kits.clear();
-        if (!file.exists()) return;
-        try {
-            CompoundTag root = NbtIo.readCompressed(file);
-            if (root == null) return;
-            ListTag kitList = root.getList("Kits", 10);
-            for (int i = 0; i < kitList.size(); i++) {
-                CompoundTag kTag = kitList.getCompound(i);
-                Kit kit = new Kit();
-                kit.name = kTag.getString("Name");
-                kit.permission = kTag.getString("Permission");
-                kit.cooldownHours = kTag.getInt("Cooldown");
-                kit.icon = ItemStack.of(kTag.getCompound("Icon"));
+        synchronized (kits) {
+            kits.clear();
+            if (!file.exists()) return;
+            try {
+                CompoundTag root = NbtIo.readCompressed(file);
+                if (root == null) return;
+                ListTag kitList = root.getList("Kits", 10);
+                for (int i = 0; i < kitList.size(); i++) {
+                    CompoundTag kTag = kitList.getCompound(i);
+                    String name = kTag.getString("Name");
+                    if (name == null || name.isBlank()) continue;
 
-                ListTag itemList = kTag.getList("Items", 10);
-                for (int j = 0; j < itemList.size(); j++) {
-                    kit.items.add(ItemStack.of(itemList.getCompound(j)));
+                    Kit kit = new Kit();
+                    kit.name = name;
+                    kit.permission = kTag.getString("Permission");
+                    kit.cooldownHours = Math.max(0, kTag.getInt("Cooldown"));
+                    kit.icon = ItemStack.of(kTag.getCompound("Icon"));
+
+                    ListTag itemList = kTag.getList("Items", 10);
+                    for (int j = 0; j < itemList.size(); j++) {
+                        ItemStack stack = ItemStack.of(itemList.getCompound(j));
+                        if (!stack.isEmpty()) {
+                            kit.items.add(stack);
+                        }
+                    }
+
+                    Set<String> keyNames = new LinkedHashSet<>();
+                    ListTag keyList = kTag.getList("CrateKeys", 8);
+                    for (int j = 0; j < keyList.size(); j++) {
+                        String keyName = normalizeKeyName(keyList.getString(j));
+                        if (!keyName.isBlank()) keyNames.add(keyName);
+                    }
+
+                    kit.crateKeys.addAll(keyNames);
+                    kits.put(kit.name.toLowerCase(Locale.ROOT), kit);
                 }
-
-                Set<String> keyNames = new LinkedHashSet<>();
-                ListTag keyList = kTag.getList("CrateKeys", 8);
-                for (int j = 0; j < keyList.size(); j++) {
-                    String keyName = normalizeKeyName(keyList.getString(j));
-                    if (!keyName.isBlank()) keyNames.add(keyName);
-                }
-
-                kit.crateKeys.addAll(keyNames);
-                kits.put(kit.name.toLowerCase(Locale.ROOT), kit);
+                System.out.println("[EvoKits] Loaded " + kits.size() + " kit(s) from config.");
+            } catch (Exception e) {
+                e.printStackTrace();
             }
-            System.out.println("[EvoKits] Loaded " + kits.size() + " kit(s) from config.");
-        } catch (Exception e) {
-            e.printStackTrace();
         }
     }
 
-    public void createKit(String name, int cooldownHours, List<ItemStack> inventoryItems) {
+    public boolean createKit(String name, int cooldownHours, List<ItemStack> inventoryItems) {
+        if (!isValidKitName(name)) return false;
+
         Kit kit = new Kit();
         kit.name = name;
         kit.permission = "kit." + name.toLowerCase(Locale.ROOT);
-        kit.cooldownHours = cooldownHours;
+        kit.cooldownHours = Math.max(0, cooldownHours);
 
         kit.icon = ItemStack.EMPTY;
         for (ItemStack stack : inventoryItems) {
-            if (!stack.isEmpty()) {
-                kit.icon = stack.copy();
-                break;
+            if (stack != null && !stack.isEmpty()) {
+                ItemStack copy = stack.copy();
+                if (kit.icon.isEmpty()) {
+                    kit.icon = copy.copy();
+                }
+                kit.items.add(copy);
             }
         }
 
-        kit.items.addAll(inventoryItems);
         kits.put(name.toLowerCase(Locale.ROOT), kit);
         save();
+        return true;
     }
 
     public boolean addCrateKey(String keyName, String kitName) {
+        if (kitName == null) return false;
         Kit kit = kits.get(kitName.toLowerCase(Locale.ROOT));
         if (kit == null) return false;
 
         String normalizedKey = normalizeKeyName(keyName);
         if (normalizedKey.isBlank()) return false;
 
-        if (!kit.crateKeys.contains(normalizedKey)) {
-            kit.crateKeys.add(normalizedKey);
-            save();
+        synchronized (kits) {
+            if (!kit.crateKeys.contains(normalizedKey)) {
+                kit.crateKeys.add(normalizedKey);
+            }
         }
+        save();
         return true;
     }
 
@@ -180,17 +253,46 @@ public class KitManager {
         return granted;
     }
 
-    public void deleteKit(String name) {
-        kits.remove(name.toLowerCase(Locale.ROOT));
+    public boolean deleteKit(String name) {
+        if (name == null || name.isBlank()) return false;
+        String kitKey = name.toLowerCase(Locale.ROOT);
+        Kit removed = kits.remove(kitKey);
+        if (removed == null) return false;
+
         save();
+        for (Map<String, Long> playerMap : cooldownCache.values()) {
+            playerMap.remove(kitKey);
+        }
+
+        Runnable deleteDbTask = () -> {
+            synchronized (DatabaseManager.get()) {
+                try {
+                    Connection conn = DatabaseManager.get().getConnection();
+                    if (conn == null || conn.isClosed()) return;
+                    try (PreparedStatement ps = conn.prepareStatement("DELETE FROM player_kit_cooldowns WHERE kit_name = ?")) {
+                        ps.setString(1, kitKey);
+                        ps.executeUpdate();
+                    }
+                } catch (Exception e) {
+                    e.printStackTrace();
+                }
+            }
+        };
+        if (shuttingDown || dbExecutor.isShutdown()) {
+            deleteDbTask.run();
+        } else {
+            dbExecutor.execute(deleteDbTask);
+        }
+        return true;
     }
 
     public long getRemainingCooldownSeconds(UUID uuid, String kitName) {
+        if (uuid == null || kitName == null) return 0;
         Kit kit = kits.get(kitName.toLowerCase(Locale.ROOT));
         if (kit == null || kit.cooldownHours <= 0) return 0;
 
         long lastClaim = getCooldownFromCacheOrDB(uuid, kit.name.toLowerCase(Locale.ROOT));
-        if (lastClaim <= 0) return 0;
+        if (lastClaim <= 0) return lastClaim < 0 ? -1L : 0L;
 
         long cooldownMillis = (long) kit.cooldownHours * 3600L * 1000L;
         long elapsed = System.currentTimeMillis() - lastClaim;
@@ -201,44 +303,85 @@ public class KitManager {
 
     private long getCooldownFromCacheOrDB(UUID uuid, String kitKey) {
         Map<String, Long> playerMap = cooldownCache.computeIfAbsent(uuid, k -> new ConcurrentHashMap<>());
-        if (playerMap.containsKey(kitKey)) {
-            return playerMap.get(kitKey);
+        Long cached = playerMap.get(kitKey);
+        if (cached != null) {
+            return cached;
         }
 
-        try {
-            Connection conn = DatabaseManager.get().getConnection();
-            try (PreparedStatement ps = conn.prepareStatement("SELECT last_claimed FROM player_kit_cooldowns WHERE uuid = ? AND kit_name = ?")) {
-                ps.setString(1, uuid.toString());
-                ps.setString(2, kitKey);
-                ResultSet rs = ps.executeQuery();
-                if (rs.next()) {
-                    long val = rs.getLong("last_claimed");
-                    playerMap.put(kitKey, val);
-                    return val;
+        synchronized (DatabaseManager.get()) {
+            try {
+                Connection conn = DatabaseManager.get().getConnection();
+                if (conn == null || conn.isClosed()) {
+                    return -1L;
+                }
+                try (PreparedStatement ps = conn.prepareStatement("SELECT last_claimed FROM player_kit_cooldowns WHERE uuid = ? AND kit_name = ?")) {
+                    ps.setString(1, uuid.toString());
+                    ps.setString(2, kitKey);
+                    try (ResultSet rs = ps.executeQuery()) {
+                        if (rs.next()) {
+                            long val = rs.getLong("last_claimed");
+                            playerMap.put(kitKey, val);
+                            return val;
+                        }
+                        playerMap.put(kitKey, 0L);
+                        return 0L;
+                    }
+                }
+            } catch (Exception e) {
+                e.printStackTrace();
+                return -1L;
+            }
+        }
+    }
+
+    private static boolean isPlayerInCombat(ServerPlayer player) {
+        if (player == null) return false;
+        if (!combatMethodChecked) {
+            combatMethodChecked = true;
+            if (ModList.get().isLoaded("evocombat")) {
+                try {
+                    Class<?> cls = Class.forName("org.evocraft.evocombat.combat.CombatLogManager");
+                    combatIsInCombatMethod = cls.getMethod("isInCombat", ServerPlayer.class);
+                } catch (Throwable ignored) {
+                    combatIsInCombatMethod = null;
                 }
             }
-        } catch (Exception e) {
-            e.printStackTrace();
         }
-
-        playerMap.put(kitKey, 0L);
-        return 0L;
+        if (combatIsInCombatMethod != null) {
+            try {
+                Object res = combatIsInCombatMethod.invoke(null, player);
+                return Boolean.TRUE.equals(res);
+            } catch (Throwable ignored) {}
+        }
+        return false;
     }
 
     public boolean claimKit(ServerPlayer player, String kitName) {
-        Kit kit = kits.get(kitName.toLowerCase(Locale.ROOT));
+        if (player == null || kitName == null || kitName.isBlank()) return false;
+        String kitKey = kitName.toLowerCase(Locale.ROOT);
+        Kit kit = kits.get(kitKey);
         if (kit == null) {
             player.sendSystemMessage(Component.literal("§c✖ Kit §e" + kitName + " §cdoes not exist!"));
             return false;
         }
 
-        if (!hasPermission(player, kit.permission) && !player.hasPermissions(2)) {
+        boolean isOp = player.hasPermissions(2);
+        if (!isOp && isPlayerInCombat(player)) {
+            player.sendSystemMessage(Component.literal("§c✖ You cannot claim kits while in combat!"));
+            return false;
+        }
+
+        if (!isOp && !hasPermission(player, kit.permission)) {
             player.sendSystemMessage(Component.literal("§c✖ You do not have permission to claim kit §e" + kit.name + "§c!"));
             return false;
         }
 
         long remainingSec = getRemainingCooldownSeconds(player.getUUID(), kit.name);
-        if (remainingSec > 0 && !player.hasPermissions(2)) {
+        if (remainingSec < 0 && !isOp) {
+            player.sendSystemMessage(Component.literal("§c✖ Could not verify kit cooldown right now. Please try again shortly."));
+            return false;
+        }
+        if (remainingSec > 0 && !isOp) {
             long hours = remainingSec / 3600;
             long minutes = (remainingSec % 3600) / 60;
             long seconds = remainingSec % 60;
@@ -247,6 +390,7 @@ public class KitManager {
         }
 
         for (ItemStack stack : kit.items) {
+            if (stack == null || stack.isEmpty()) continue;
             ItemStack copy = stack.copy();
             if (!player.getInventory().add(copy)) {
                 player.drop(copy, false);
@@ -256,27 +400,37 @@ public class KitManager {
         int keysGranted = grantCrateKeys(player, kit);
 
         long now = System.currentTimeMillis();
-        cooldownCache.computeIfAbsent(player.getUUID(), k -> new ConcurrentHashMap<>()).put(kit.name.toLowerCase(Locale.ROOT), now);
+        UUID playerUuid = player.getUUID();
+        cooldownCache.computeIfAbsent(playerUuid, k -> new ConcurrentHashMap<>()).put(kitKey, now);
 
-        new Thread(() -> {
-            try {
-                Connection conn = DatabaseManager.get().getConnection();
-                String query = "MYSQL".equalsIgnoreCase(DatabaseManager.get().type)
-                        ? "INSERT INTO player_kit_cooldowns (uuid, kit_name, last_claimed) VALUES (?, ?, ?) ON DUPLICATE KEY UPDATE last_claimed = ?"
-                        : "INSERT INTO player_kit_cooldowns (uuid, kit_name, last_claimed) VALUES (?, ?, ?) ON CONFLICT(uuid, kit_name) DO UPDATE SET last_claimed = excluded.last_claimed";
-                try (PreparedStatement ps = conn.prepareStatement(query)) {
-                    ps.setString(1, player.getUUID().toString());
-                    ps.setString(2, kit.name.toLowerCase(Locale.ROOT));
-                    ps.setLong(3, now);
-                    if ("MYSQL".equalsIgnoreCase(DatabaseManager.get().type)) {
-                        ps.setLong(4, now);
+        Runnable saveCooldownTask = () -> {
+            synchronized (DatabaseManager.get()) {
+                try {
+                    Connection conn = DatabaseManager.get().getConnection();
+                    if (conn == null || conn.isClosed()) return;
+                    boolean mySql = DatabaseManager.get().isMySql();
+                    String query = mySql
+                            ? "INSERT INTO player_kit_cooldowns (uuid, kit_name, last_claimed) VALUES (?, ?, ?) ON DUPLICATE KEY UPDATE last_claimed = ?"
+                            : "INSERT INTO player_kit_cooldowns (uuid, kit_name, last_claimed) VALUES (?, ?, ?) ON CONFLICT(uuid, kit_name) DO UPDATE SET last_claimed = excluded.last_claimed";
+                    try (PreparedStatement ps = conn.prepareStatement(query)) {
+                        ps.setString(1, playerUuid.toString());
+                        ps.setString(2, kitKey);
+                        ps.setLong(3, now);
+                        if (mySql) {
+                            ps.setLong(4, now);
+                        }
+                        ps.executeUpdate();
                     }
-                    ps.executeUpdate();
+                } catch (Exception e) {
+                    e.printStackTrace();
                 }
-            } catch (Exception e) {
-                e.printStackTrace();
             }
-        }).start();
+        };
+        if (shuttingDown || dbExecutor.isShutdown()) {
+            saveCooldownTask.run();
+        } else {
+            dbExecutor.execute(saveCooldownTask);
+        }
 
         player.sendSystemMessage(Component.literal("§a✔ Successfully claimed kit §l" + kit.name + "§a!"));
         if (keysGranted > 0) {
@@ -286,14 +440,16 @@ public class KitManager {
     }
 
     public static boolean hasPermission(ServerPlayer player, String permission) {
+        if (player == null) return false;
         if (player.hasPermissions(2)) return true;
+        if (permission == null || permission.isBlank()) return false;
         try {
             net.luckperms.api.LuckPerms lp = net.luckperms.api.LuckPermsProvider.get();
             net.luckperms.api.model.user.User user = lp.getUserManager().getUser(player.getUUID());
             if (user != null) {
                 return user.getCachedData().getPermissionData().checkPermission(permission).asBoolean();
             }
-        } catch (Exception ignored) {}
+        } catch (Throwable ignored) {}
         return false;
     }
 

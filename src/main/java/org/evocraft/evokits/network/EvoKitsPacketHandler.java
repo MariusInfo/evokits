@@ -72,9 +72,9 @@ public class EvoKitsPacketHandler {
     public static List<KitDefinition> buildKitsForPlayer(ServerPlayer player) {
         List<KitDefinition> result = new ArrayList<>();
         boolean isOp = player.hasPermissions(2);
-        for (KitManager.Kit kit : KitManager.get().kits.values()) {
+        for (KitManager.Kit kit : KitManager.get().getKitsSnapshot()) {
             boolean unlocked = isOp || KitManager.hasPermission(player, kit.permission);
-            long remainingSec = isOp ? 0L : KitManager.get().getRemainingCooldownSeconds(player.getUUID(), kit.name);
+            long remainingSec = isOp ? 0L : Math.max(0L, KitManager.get().getRemainingCooldownSeconds(player.getUUID(), kit.name));
             result.add(new KitDefinition(
                     kit.name,
                     KitDefinition.formatDisplayName(kit.name),
@@ -101,24 +101,24 @@ public class EvoKitsPacketHandler {
 
         public S2C_SyncKitsPacket(FriendlyByteBuf buf) {
             this.openScreen = buf.readBoolean();
-            int count = buf.readVarInt();
+            int count = Math.max(0, Math.min(buf.readVarInt(), 256));
             this.kits = new ArrayList<>(count);
             for (int i = 0; i < count; i++) {
                 String id = buf.readUtf(128);
                 String displayName = buf.readUtf(128);
                 String permission = buf.readUtf(256);
                 ItemStack icon = buf.readItem();
-                int cooldownHours = buf.readVarInt();
-                long remainingSeconds = buf.readVarLong();
+                int cooldownHours = Math.max(0, buf.readVarInt());
+                long remainingSeconds = Math.max(0L, buf.readVarLong());
                 boolean unlocked = buf.readBoolean();
 
-                int itemCount = buf.readVarInt();
+                int itemCount = Math.max(0, Math.min(buf.readVarInt(), 128));
                 List<ItemStack> items = new ArrayList<>(itemCount);
                 for (int j = 0; j < itemCount; j++) {
                     items.add(buf.readItem());
                 }
 
-                int keyCount = buf.readVarInt();
+                int keyCount = Math.max(0, Math.min(buf.readVarInt(), 64));
                 List<String> crateKeys = new ArrayList<>(keyCount);
                 for (int j = 0; j < keyCount; j++) {
                     crateKeys.add(buf.readUtf(128));
@@ -211,7 +211,7 @@ public class EvoKitsPacketHandler {
         public void handle(Supplier<NetworkEvent.Context> ctx) {
             ctx.get().enqueueWork(() -> {
                 ServerPlayer player = ctx.get().getSender();
-                if (player != null) {
+                if (player != null && !kitId.isBlank()) {
                     KitManager.get().claimKit(player, kitId);
                     sendKitsToPlayer(player, false);
                 }
