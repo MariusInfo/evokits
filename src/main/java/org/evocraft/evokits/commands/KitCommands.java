@@ -60,6 +60,11 @@ public class KitCommands {
                                             String name = StringArgumentType.getString(context, "name");
                                             int cd = IntegerArgumentType.getInteger(context, "cooldownHours");
 
+                                            if (!KitManager.isValidKitName(name)) {
+                                                player.sendSystemMessage(Component.literal("§cInvalid kit name! Use 1-32 letters, numbers, '_' or '-'."));
+                                                return 0;
+                                            }
+
                                             List<ItemStack> items = new ArrayList<>();
                                             for (int i = 0; i < 36; i++) {
                                                 ItemStack stack = player.getInventory().getItem(i);
@@ -84,7 +89,10 @@ public class KitCommands {
                                 .suggests((context, builder) -> SharedSuggestionProvider.suggest(KitManager.get().kits.keySet(), builder))
                                 .executes(context -> {
                                     String name = StringArgumentType.getString(context, "name");
-                                    KitManager.get().deleteKit(name);
+                                    if (!KitManager.get().deleteKit(name)) {
+                                        context.getSource().sendFailure(Component.literal("§c[EvoKits] Kit " + name + " does not exist!"));
+                                        return 0;
+                                    }
                                     context.getSource().sendSuccess(() -> Component.literal("§c✔ Kit " + name + " was deleted!"), true);
                                     return 1;
                                 })))
@@ -117,7 +125,8 @@ public class KitCommands {
     }
 
     private static void listKits(CommandSourceStack source) {
-        if (KitManager.get().kits.isEmpty()) {
+        List<KitManager.Kit> snapshot = KitManager.get().getKitsSnapshot();
+        if (snapshot.isEmpty()) {
             source.sendSuccess(() -> Component.literal("§eNo kits are currently configured on the server."), false);
             return;
         }
@@ -128,9 +137,9 @@ public class KitCommands {
         ServerPlayer player = null;
         try { player = source.getPlayerOrException(); } catch (Exception ignored) {}
 
-        for (KitManager.Kit kit : KitManager.get().kits.values()) {
+        for (KitManager.Kit kit : snapshot) {
             boolean hasPerm = player == null || KitManager.hasPermission(player, kit.permission) || player.hasPermissions(2);
-            long cdSec = player != null ? KitManager.get().getRemainingCooldownSeconds(player.getUUID(), kit.name) : 0;
+            long cdSec = player != null ? Math.max(0L, KitManager.get().getRemainingCooldownSeconds(player.getUUID(), kit.name)) : 0;
 
             String status;
             if (!hasPerm) {
